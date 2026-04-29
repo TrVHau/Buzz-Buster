@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Buzz-Buster</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="app-header">
+        <img class="app-icon" src="assets/icon-48.png" alt="">
+        <div>
+          <h1>Buzz-Buster</h1>
+          <p id="modeStatus" class="status status--idle">Stopped</p>
+        </div>
+      </header>
+
+      <form id="settingsForm" class="settings-form">
+        <label class="field">
+          <span>Min delay</span>
+          <span class="input-row">
+            <input id="minDelay" type="number" min="5" max="7199" step="1" inputmode="numeric">
+            <span>sec</span>
+          </span>
+        </label>
+
+        <label class="field">
+          <span>Max delay</span>
+          <span class="input-row">
+            <input id="maxDelay" type="number" min="6" max="7200" step="1" inputmode="numeric">
+            <span>sec</span>
+          </span>
+        </label>
+
+        <p id="message" class="message" role="status" aria-live="polite"></p>
+
+        <div class="button-row">
+          <button id="startButton" class="button button--start" type="submit">Start</button>
+          <button id="stopButton" class="button button--stop" type="button">Stop</button>
+        </div>
+      </form>
+
+      <section class="kill-counter" aria-label="Kill counter">
+        <span>Kills</span>
+        <strong id="killedCount">0</strong>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
