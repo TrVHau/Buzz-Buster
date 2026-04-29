@@ -1,9 +1,11 @@
 (() => {
-  if (typeof window.__buzzBusterCleanup === "function") {
+  const CLEANUP_KEY = "__buzzBusterCleanup";
+
+  if (typeof window[CLEANUP_KEY] === "function") {
     try {
-      window.__buzzBusterCleanup();
+      window[CLEANUP_KEY]();
     } catch (_error) {
-      // A stale content-script context can fail cleanup after extension reload.
+      // Ignore stale cleanup failures after an extension reload.
     }
   }
 
@@ -14,23 +16,42 @@
     killedCount: 0
   };
 
-  const MAX_Z_INDEX = 2147483647;
   const MIN_DELAY_SECONDS = 5;
   const MAX_DELAY_SECONDS = 7200;
-  const STYLE_ID = "buzz-buster-style";
-  const MOSQUITO_ID = "buzz-buster-mosquito";
-  const RACKET_PROMPT_ID = "buzz-buster-racket-prompt";
+  const MAX_Z_INDEX = 2147483647;
+
+  const IDS = {
+    style: "buzz-buster-style",
+    mosquito: "buzz-buster-mosquito",
+    racketPrompt: "buzz-buster-racket-prompt"
+  };
+
+  const CLASSES = {
+    racketArmed: "buzz-buster-racket-armed",
+    mosquitoHit: "buzz-buster-hit",
+    promptNudge: "buzz-buster-racket-prompt--nudge",
+    splat: "buzz-buster-splat"
+  };
+
+  const ASSETS = {
+    mosquito: "assets/mosquito.png",
+    racketCursor: "assets/racket-cursor.png",
+    buzz: "assets/mosquito-buzz.mp3",
+    miss: "assets/slap.mp3",
+    hit: "assets/slap-ahh.mp3"
+  };
 
   let state = { ...DEFAULT_SETTINGS };
   let mosquitoTimer = null;
   let mosquitoElement = null;
+  let racketPromptElement = null;
   let animationFrame = null;
   let buzzAudio = null;
   let lastFrameTime = 0;
   let mousePosition = null;
   let pendingSpawn = false;
   let racketArmed = false;
-  let racketPromptElement = null;
+  let destroyed = false;
 
   const motion = {
     x: 0,
@@ -39,15 +60,15 @@
     vy: 90
   };
 
-  window.__buzzBusterCleanup = cleanup;
+  window[CLEANUP_KEY] = cleanup;
   init();
 
   function init() {
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    chrome.runtime.onMessage.addListener(handleRuntimeMessage);
-    chrome.storage.onChanged.addListener(handleStorageChange);
+    addChromeListener(() => chrome.runtime.onMessage.addListener(handleRuntimeMessage));
+    addChromeListener(() => chrome.storage.onChanged.addListener(handleStorageChange));
 
-    chrome.storage.local.get(DEFAULT_SETTINGS, (items) => {
+    storageGet(DEFAULT_SETTINGS, (items) => {
       state = normalizeSettings(items);
       if (state.buzzBusterEnabled) {
         startMode();
@@ -152,7 +173,7 @@
   function scheduleNextMosquito() {
     clearMosquitoTimer();
 
-    if (!state.buzzBusterEnabled || mosquitoElement) {
+    if (!state.buzzBusterEnabled || mosquitoElement || destroyed) {
       return;
     }
 
@@ -162,7 +183,7 @@
   function showMosquito() {
     clearMosquitoTimer();
 
-    if (!state.buzzBusterEnabled || mosquitoElement) {
+    if (!state.buzzBusterEnabled || mosquitoElement || destroyed) {
       pendingSpawn = false;
       return;
     }
@@ -172,42 +193,57 @@
       return;
     }
 
-    injectStyles();
-    showRacketPrompt();
+    if (!injectStyles()) {
+      return;
+    }
+
+    const host = getHostElement();
+    if (!host) {
+      return;
+    }
+
     disarmRacket();
+    showRacketPrompt();
+    if (destroyed) {
+      return;
+    }
     pendingSpawn = false;
 
     const wrapper = document.createElement("div");
-    wrapper.id = MOSQUITO_ID;
+    wrapper.id = IDS.mosquito;
+    wrapper.tabIndex = 0;
     wrapper.setAttribute("role", "button");
     wrapper.setAttribute("aria-label", "Swat mosquito");
-    wrapper.tabIndex = 0;
 
     const image = document.createElement("img");
-    image.src = chrome.runtime.getURL("assets/mosquito.png");
+    const mosquitoUrl = getAssetUrl(ASSETS.mosquito);
+    if (!mosquitoUrl) {
+      return;
+    }
+    image.src = mosquitoUrl;
     image.alt = "";
     image.draggable = false;
     wrapper.appendChild(image);
 
     wrapper.addEventListener("click", killMosquito);
-    wrapper.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        killMosquito(event);
-      }
-    });
+    wrapper.addEventListener("keydown", handleMosquitoKeydown);
 
     const size = getMosquitoSize();
     wrapper.style.setProperty("width", `${size}px`, "important");
     mosquitoElement = wrapper;
-    getHostElement().appendChild(wrapper);
+    host.appendChild(wrapper);
 
     resetMotion(size);
     applyMosquitoPosition();
     startBuzzSound();
     startFlight();
-    window.addEventListener("mousemove", handleMouseMove, { passive: true });
-    window.addEventListener("resize", keepMosquitoInViewport, { passive: true });
-    document.addEventListener("click", handleRacketMissClick, true);
+    addActivePageListeners();
+  }
+
+  function handleMosquitoKeydown(event) {
+    if (event.key === "Enter" || event.key === " ") {
+      killMosquito(event);
+    }
   }
 
   function killMosquito(event) {
@@ -225,26 +261,24 @@
       return;
     }
 
-    const rect = mosquitoElement.getBoundingClientRect();
+    const deadElement = mosquitoElement;
+    const rect = deadElement.getBoundingClientRect();
     const splatX = rect.left + rect.width / 2;
     const splatY = rect.top + rect.height / 2;
-    const deadElement = mosquitoElement;
 
     mosquitoElement = null;
     stopFlight();
     stopBuzzSound();
-    window.removeEventListener("mousemove", handleMouseMove);
-    window.removeEventListener("resize", keepMosquitoInViewport);
-    document.removeEventListener("click", handleRacketMissClick, true);
+    removeActivePageListeners();
     removeRacketPrompt();
     disarmRacket();
-    playHitSound();
+    playOneShot(ASSETS.hit, 0.62);
     showSplat(splatX, splatY);
     incrementKillCount();
 
-    deadElement.style.setProperty("--ms-hit-x", `${motion.x}px`);
-    deadElement.style.setProperty("--ms-hit-y", `${motion.y}px`);
-    deadElement.classList.add("buzz-buster-hit");
+    deadElement.style.setProperty("--bb-hit-x", `${motion.x}px`);
+    deadElement.style.setProperty("--bb-hit-y", `${motion.y}px`);
+    deadElement.classList.add(CLASSES.mosquitoHit);
     window.setTimeout(() => deadElement.remove(), 170);
 
     scheduleNextMosquito();
@@ -255,14 +289,24 @@
     stopBuzzSound();
     removeRacketPrompt();
     disarmRacket();
-    window.removeEventListener("mousemove", handleMouseMove);
-    window.removeEventListener("resize", keepMosquitoInViewport);
-    document.removeEventListener("click", handleRacketMissClick, true);
+    removeActivePageListeners();
 
     if (mosquitoElement) {
       mosquitoElement.remove();
       mosquitoElement = null;
     }
+  }
+
+  function addActivePageListeners() {
+    window.addEventListener("mousemove", handleMouseMove, { passive: true });
+    window.addEventListener("resize", keepMosquitoInViewport, { passive: true });
+    document.addEventListener("click", handleRacketMissClick, true);
+  }
+
+  function removeActivePageListeners() {
+    window.removeEventListener("mousemove", handleMouseMove);
+    window.removeEventListener("resize", keepMosquitoInViewport);
+    document.removeEventListener("click", handleRacketMissClick, true);
   }
 
   function startFlight() {
@@ -303,32 +347,32 @@
       return;
     }
 
-    const size = mosquitoElement.getBoundingClientRect().width || getMosquitoSize();
+    const size = getCurrentMosquitoSize();
     const centerX = motion.x + size / 2;
     const centerY = motion.y + size / 2;
     const dx = centerX - mousePosition.x;
     const dy = centerY - mousePosition.y;
     const distance = Math.hypot(dx, dy);
-    const repelRadius = 160;
+    const repelRadius = 150;
 
     if (distance <= 0 || distance > repelRadius) {
       return;
     }
 
-    const force = ((repelRadius - distance) / repelRadius) * 380;
+    const force = ((repelRadius - distance) / repelRadius) * 360;
     motion.vx += (dx / distance) * force * delta;
     motion.vy += (dy / distance) * force * delta;
   }
 
   function addRandomDrift(delta) {
-    motion.vx += (Math.random() - 0.5) * 90 * delta;
-    motion.vy += (Math.random() - 0.5) * 90 * delta;
+    motion.vx += (Math.random() - 0.5) * 78 * delta;
+    motion.vy += (Math.random() - 0.5) * 78 * delta;
   }
 
   function clampVelocity() {
     const speed = Math.hypot(motion.vx, motion.vy);
-    const minSpeed = 82;
-    const maxSpeed = 230;
+    const minSpeed = 78;
+    const maxSpeed = 210;
 
     if (speed > maxSpeed) {
       const scale = maxSpeed / speed;
@@ -349,7 +393,7 @@
       return;
     }
 
-    const size = mosquitoElement.getBoundingClientRect().width || getMosquitoSize();
+    const size = getCurrentMosquitoSize();
     const maxX = Math.max(8, window.innerWidth - size - 8);
     const maxY = Math.max(8, window.innerHeight - size - 8);
 
@@ -376,7 +420,7 @@
     }
 
     const flip = motion.vx < 0 ? -1 : 1;
-    const wiggle = Math.sin(timestamp / 60) * 5;
+    const wiggle = Math.sin(timestamp / 65) * 4.5;
     mosquitoElement.style.transform = `translate3d(${motion.x}px, ${motion.y}px, 0) scaleX(${flip}) rotate(${wiggle}deg)`;
   }
 
@@ -384,7 +428,7 @@
     const maxX = Math.max(8, window.innerWidth - size - 8);
     const maxY = Math.max(8, window.innerHeight - size - 8);
     const angle = Math.random() * Math.PI * 2;
-    const speed = 110 + Math.random() * 70;
+    const speed = 104 + Math.random() * 64;
 
     motion.x = randomBetween(8, maxX);
     motion.y = randomBetween(8, maxY);
@@ -425,13 +469,21 @@
   function startBuzzSound() {
     stopBuzzSound();
 
-    buzzAudio = new Audio(chrome.runtime.getURL("assets/mosquito-buzz.mp3"));
-    buzzAudio.loop = true;
-    buzzAudio.volume = 0.22;
+    const buzzUrl = getAssetUrl(ASSETS.buzz);
+    if (!buzzUrl) {
+      return;
+    }
 
-    const playPromise = buzzAudio.play();
-    if (playPromise && typeof playPromise.catch === "function") {
-      playPromise.catch(() => {});
+    try {
+      buzzAudio = new Audio(buzzUrl);
+      buzzAudio.loop = true;
+      buzzAudio.volume = 0.2;
+      const playPromise = buzzAudio.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(() => {});
+      }
+    } catch (_error) {
+      buzzAudio = null;
     }
   }
 
@@ -440,28 +492,31 @@
       return;
     }
 
-    buzzAudio.pause();
-    buzzAudio.currentTime = 0;
+    try {
+      buzzAudio.pause();
+      buzzAudio.currentTime = 0;
+    } catch (_error) {
+      // Audio can become invalid after extension reload.
+    }
+
     buzzAudio = null;
   }
 
-  function playMissSound() {
-    const audio = new Audio(chrome.runtime.getURL("assets/slap.mp3"));
-    audio.volume = 0.55;
-
-    const playPromise = audio.play();
-    if (playPromise && typeof playPromise.catch === "function") {
-      playPromise.catch(() => {});
+  function playOneShot(assetPath, volume) {
+    const url = getAssetUrl(assetPath);
+    if (!url) {
+      return;
     }
-  }
 
-  function playHitSound() {
-    const audio = new Audio(chrome.runtime.getURL("assets/slap-ahh.mp3"));
-    audio.volume = 0.62;
-
-    const playPromise = audio.play();
-    if (playPromise && typeof playPromise.catch === "function") {
-      playPromise.catch(() => {});
+    try {
+      const audio = new Audio(url);
+      audio.volume = volume;
+      const playPromise = audio.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(() => {});
+      }
+    } catch (_error) {
+      // Page or extension context may block audio; gameplay continues.
     }
   }
 
@@ -476,31 +531,49 @@
 
     event.preventDefault();
     event.stopPropagation();
-    playMissSound();
+    playOneShot(ASSETS.miss, 0.55);
   }
 
   function incrementKillCount() {
-    state.killedCount += 1;
-    chrome.storage.local.set({ killedCount: state.killedCount });
+    storageGet({ killedCount: 0 }, (items) => {
+      const nextCount = normalizeCount(items.killedCount) + 1;
+      state.killedCount = nextCount;
+      storageSet({ killedCount: nextCount });
+    });
   }
 
   function showRacketPrompt() {
     removeRacketPrompt();
 
+    const host = getHostElement();
+    if (!host) {
+      return;
+    }
+
     racketPromptElement = document.createElement("div");
-    racketPromptElement.id = RACKET_PROMPT_ID;
+    racketPromptElement.id = IDS.racketPrompt;
 
     const button = document.createElement("button");
     button.type = "button";
     button.setAttribute("aria-label", "Equip mosquito racket");
-    button.innerHTML = `
-      <img src="${chrome.runtime.getURL("assets/racket-cursor.png")}" alt="">
-      <span>Equip racket</span>
-    `;
+
+    const image = document.createElement("img");
+    const racketUrl = getAssetUrl(ASSETS.racketCursor);
+    if (!racketUrl) {
+      racketPromptElement = null;
+      return;
+    }
+    image.src = racketUrl;
+    image.alt = "";
+
+    const label = document.createElement("span");
+    label.textContent = "Equip racket";
+
+    button.append(image, label);
     button.addEventListener("click", armRacket);
 
     racketPromptElement.appendChild(button);
-    getHostElement().appendChild(racketPromptElement);
+    host.appendChild(racketPromptElement);
   }
 
   function removeRacketPrompt() {
@@ -519,13 +592,13 @@
     }
 
     racketArmed = true;
-    document.documentElement.classList.add("buzz-buster-racket-armed");
+    document.documentElement.classList.add(CLASSES.racketArmed);
     removeRacketPrompt();
   }
 
   function disarmRacket() {
     racketArmed = false;
-    document.documentElement.classList.remove("buzz-buster-racket-armed");
+    document.documentElement.classList.remove(CLASSES.racketArmed);
   }
 
   function nudgeRacketPrompt() {
@@ -534,38 +607,56 @@
       return;
     }
 
-    racketPromptElement.classList.remove("buzz-buster-racket-prompt--nudge");
+    racketPromptElement.classList.remove(CLASSES.promptNudge);
     void racketPromptElement.offsetWidth;
-    racketPromptElement.classList.add("buzz-buster-racket-prompt--nudge");
+    racketPromptElement.classList.add(CLASSES.promptNudge);
   }
 
   function showSplat(x, y) {
-    injectStyles();
+    const host = getHostElement();
+    if (!host || !injectStyles()) {
+      return;
+    }
+
     const splat = document.createElement("div");
-    splat.className = "buzz-buster-splat";
+    splat.className = CLASSES.splat;
     splat.textContent = "SPLAT!";
     splat.style.left = `${x}px`;
     splat.style.top = `${y}px`;
-    getHostElement().appendChild(splat);
+    host.appendChild(splat);
 
     window.setTimeout(() => splat.remove(), 700);
   }
 
   function injectStyles() {
-    if (document.getElementById(STYLE_ID)) {
-      return;
+    if (document.getElementById(IDS.style)) {
+      return true;
     }
 
-    const cursorUrl = chrome.runtime.getURL("assets/racket-cursor.png");
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
-    style.textContent = `
-      html.buzz-buster-racket-armed,
-      html.buzz-buster-racket-armed * {
+    const cursorUrl = getAssetUrl(ASSETS.racketCursor);
+    if (!cursorUrl) {
+      return false;
+    }
+
+    try {
+      const style = document.createElement("style");
+      style.id = IDS.style;
+      style.textContent = buildStyles(cursorUrl);
+      (document.head || document.documentElement).appendChild(style);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function buildStyles(cursorUrl) {
+    return `
+      html.${CLASSES.racketArmed},
+      html.${CLASSES.racketArmed} * {
         cursor: url("${cursorUrl}") 18 18, crosshair !important;
       }
 
-      #${MOSQUITO_ID} {
+      #${IDS.mosquito} {
         position: fixed !important;
         top: 0 !important;
         left: 0 !important;
@@ -583,7 +674,7 @@
         filter: drop-shadow(0 8px 10px rgba(0, 0, 0, 0.22)) !important;
       }
 
-      #${MOSQUITO_ID} img {
+      #${IDS.mosquito} img {
         all: initial !important;
         display: block !important;
         width: 100% !important;
@@ -593,24 +684,24 @@
         animation: buzz-buster-jitter 90ms linear infinite alternate !important;
       }
 
-      #${MOSQUITO_ID}.buzz-buster-hit {
+      #${IDS.mosquito}.${CLASSES.mosquitoHit} {
         pointer-events: none !important;
         opacity: 0 !important;
-        transform: translate3d(var(--ms-hit-x, 0), var(--ms-hit-y, 0), 0) scale(0.35) rotate(34deg) !important;
+        transform: translate3d(var(--bb-hit-x, 0), var(--bb-hit-y, 0), 0) scale(0.35) rotate(34deg) !important;
         transition: opacity 150ms ease, transform 150ms ease !important;
       }
 
-      #${RACKET_PROMPT_ID} {
+      #${IDS.racketPrompt} {
         all: initial !important;
         position: fixed !important;
         right: 16px !important;
-        bottom: 72px !important;
+        bottom: 24px !important;
         z-index: ${MAX_Z_INDEX} !important;
         display: block !important;
         pointer-events: auto !important;
       }
 
-      #${RACKET_PROMPT_ID} button {
+      #${IDS.racketPrompt} button {
         all: initial !important;
         display: flex !important;
         align-items: center !important;
@@ -628,11 +719,11 @@
         user-select: none !important;
       }
 
-      #${RACKET_PROMPT_ID} button:hover {
+      #${IDS.racketPrompt} button:hover {
         transform: translateY(-1px) !important;
       }
 
-      #${RACKET_PROMPT_ID} img {
+      #${IDS.racketPrompt} img {
         all: initial !important;
         display: block !important;
         width: 42px !important;
@@ -641,7 +732,7 @@
         pointer-events: none !important;
       }
 
-      #${RACKET_PROMPT_ID} span {
+      #${IDS.racketPrompt} span {
         all: initial !important;
         display: block !important;
         color: #1f2a1d !important;
@@ -649,11 +740,11 @@
         pointer-events: none !important;
       }
 
-      #${RACKET_PROMPT_ID}.buzz-buster-racket-prompt--nudge button {
+      #${IDS.racketPrompt}.${CLASSES.promptNudge} button {
         animation: buzz-buster-racket-nudge 360ms ease !important;
       }
 
-      .buzz-buster-splat {
+      .${CLASSES.splat} {
         all: initial !important;
         position: fixed !important;
         z-index: ${MAX_Z_INDEX} !important;
@@ -688,14 +779,70 @@
         80% { transform: translateX(4px); }
       }
     `;
-
-    (document.head || document.documentElement).appendChild(style);
   }
 
   function removeStyles() {
-    const style = document.getElementById(STYLE_ID);
+    const style = document.getElementById(IDS.style);
     if (style) {
       style.remove();
+    }
+  }
+
+  function getAssetUrl(assetPath) {
+    try {
+      if (!chrome || !chrome.runtime || typeof chrome.runtime.getURL !== "function") {
+        cleanup();
+        return "";
+      }
+
+      return chrome.runtime.getURL(assetPath);
+    } catch (_error) {
+      cleanup();
+      return "";
+    }
+  }
+
+  function storageGet(defaults, callback) {
+    try {
+      chrome.storage.local.get(defaults, (items) => {
+        let lastError = null;
+        try {
+          lastError = chrome.runtime.lastError;
+        } catch (_error) {
+          cleanup();
+          return;
+        }
+
+        if (lastError || destroyed) {
+          return;
+        }
+
+        callback(items);
+      });
+    } catch (_error) {
+      cleanup();
+    }
+  }
+
+  function storageSet(values) {
+    try {
+      chrome.storage.local.set(values, () => {
+        try {
+          void chrome.runtime.lastError;
+        } catch (_error) {
+          cleanup();
+        }
+      });
+    } catch (_error) {
+      cleanup();
+    }
+  }
+
+  function addChromeListener(register) {
+    try {
+      register();
+    } catch (_error) {
+      cleanup();
     }
   }
 
@@ -723,17 +870,29 @@
     return Math.min(70, Math.max(44, viewportBased));
   }
 
+  function getCurrentMosquitoSize() {
+    if (!mosquitoElement) {
+      return getMosquitoSize();
+    }
+
+    return mosquitoElement.getBoundingClientRect().width || getMosquitoSize();
+  }
+
   function normalizeSettings(input) {
     const minDelay = clampInteger(input.minDelay, DEFAULT_SETTINGS.minDelay, MIN_DELAY_SECONDS, MAX_DELAY_SECONDS - 1);
     const maxDelay = clampInteger(input.maxDelay, DEFAULT_SETTINGS.maxDelay, minDelay + 1, MAX_DELAY_SECONDS);
-    const killedCount = Math.max(0, Math.floor(Number(input.killedCount) || 0));
 
     return {
       buzzBusterEnabled: Boolean(input.buzzBusterEnabled),
       minDelay,
       maxDelay,
-      killedCount
+      killedCount: normalizeCount(input.killedCount)
     };
+  }
+
+  function normalizeCount(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
   }
 
   function clampInteger(value, fallback, min, max) {
@@ -761,6 +920,11 @@
   }
 
   function cleanup() {
+    if (destroyed) {
+      return;
+    }
+
+    destroyed = true;
     pendingSpawn = false;
     clearMosquitoTimer();
     removeMosquito();
@@ -768,8 +932,14 @@
     removeStyles();
     disarmRacket();
     document.removeEventListener("visibilitychange", handleVisibilityChange);
-    chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
-    chrome.storage.onChanged.removeListener(handleStorageChange);
-    window.__buzzBusterCleanup = null;
+
+    try {
+      chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
+      chrome.storage.onChanged.removeListener(handleStorageChange);
+    } catch (_error) {
+      // The extension context may already be invalid.
+    }
+
+    window[CLEANUP_KEY] = null;
   }
 })();
